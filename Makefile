@@ -1,9 +1,13 @@
 DB=research-this.db
-ALL_CSV=$(wildcard *.csv)
+TABLES=category person question ranking
+STRIPPED_CSV=$(patsubst %,%-stripped.csv,${TABLES})
 CMD_SQL=make-database.sql
 
-${DB} : ${ALL_CSV} ${CMD_SQL}
+${DB} : ${STRIPPED_CSV} ${CMD_SQL}
 	sqlite3 ${DB} < ${CMD_SQL}
 
+%-stripped.csv : %.csv
+	tail +2 $^ > $@
+
 clean :
-	@rm -f ${DB}
+	@rm -f ${DB} ${STRIPPED_CSV}

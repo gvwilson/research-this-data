@@ -5,7 +5,7 @@ CREATE TABLE category (
   id integer not null,			-- category ID
   name text not null			-- category name
 );
-.import category.csv category
+.import category-stripped.csv category
 
 -- questions
 CREATE TABLE question (
@@ -14,7 +14,7 @@ CREATE TABLE question (
     references category(id),
   content text not null			-- question text
 );
-.import question.csv question
+.import question-stripped.csv question
 
 -- people
 CREATE TABLE person (
@@ -36,7 +36,7 @@ CREATE TABLE person (
   teaching_teens_free_range text,	-- teaching free-range teens
   teaching_teens_in_schools text	-- teaching teens in schools
 );
-.import person.csv person
+.import person-stripped.csv person
 
 -- question rankings
 CREATE TABLE ranking (
@@ -48,4 +48,4 @@ CREATE TABLE ranking (
     references person(id),
   rank text				-- rank (as text)
 );
-.import ranking.csv ranking
+.import ranking-stripped.csv ranking
