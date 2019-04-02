@@ -1,0 +1,1295 @@
+---
+title: "Analysis"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+This R Markdown document holds analysis done for a paper on the questions that people teaching computing would most like computing education researchers to answer.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+## Setting Up
+
+We start by establishing a connection to the database:
+
+```{r}
+library(DBI)
+dbPath <- 'research-this.db'
+con <- dbConnect(RSQLite::SQLite(), dbPath)
+```
+
+Since we don't really have very much data, we'll write a utility function that loads the entire results of a query as a tibble:
+
+```{r}
+getAll <- function(con, query) {
+  res <- dbSendQuery(con, query)
+  result <- dbFetch(res)
+  dbClearResult(res)
+  as_tibble(result)
+}
+```
+
+Let's test it out by getting everything from the `category` table:
+
+```{r}
+getAll(con, 'select * from category')
+```
+
+Now that we have that, it's easy to load all of our tables into memory:
+
+```{r}
+dbListTables(con)
+```
+
+```{r}
+raw_category <- getAll(con, 'select * from category')
+cat(nrow(raw_category), 'records in category\n')
+
+raw_person <- getAll(con, 'select * from person')
+cat(nrow(raw_person), 'records in person\n')
+
+raw_question <- getAll(con, 'select * from question')
+cat(nrow(raw_question), 'records in question\n')
+
+raw_ranking <- getAll(con, 'select * from ranking')
+cat(nrow(raw_ranking), 'records in ranking\n')
+
+dbDisconnect(con)
+```
+
+That looks good---let's check data types:
+
+```{r}
+raw_category %>% summarize_all(class)
+```
+
+Good: the `id` is `integer` and the `name` is `character`. However, I find it easier to keep track of things if generic fields like `id` are given more meaningful names like `category_id`, so let's do that:
+
+```{r}
+category <- rename(raw_category, category_id = id, category_name = name)
+category
+```
+
+We'll do the same to create a `person` tibble:
+
+```{r}
+person <- rename(raw_person, person_id = id)
+person %>% summarize_all(class)
+```
+
+and a question table:
+
+```{r}
+question <- rename(raw_question, question_id = id, question_content = content)
+question %>% summarize_all(class)
+```
+
+and the all-important `ranking` table:
+
+```{r}
+ranking <- rename(raw_ranking, ranking_id = id)
+ranking %>% summarize_all(class)
+```
+
+It looks like the data types in all four tables have survived their transition from the SQLite database to tibbles.
+
+## Data Tidying
+
+Let's see if all respondent profiles are either entirely completed or entirely *not* completed by seeing whether any rows contain a mix of empty strings and non-empty strings:
+
+```{r}
+person_cols_not_responses <- c('person_id', 'hash_id', 'last_updated_at', 'stage')
+person_num_responses_expected <- ncol(raw_person) - length(person_cols_not_responses)
+person %>%
+  select(-person_cols_not_responses) %>%
+  pmap_int(function(...){ sum(list(...) == '')}) %>%
+  map_lgl(function(x) x %in% c(0, person_num_responses_expected)) %>%
+  all()
+```
+
+Good: this means that people either provided all of the requested demographic information or none of it. Let's simplify further selection by adding a `filled_in` column that tells us whether that person gave us demographic info or not:
+
+```{r}
+person <- person %>%
+  mutate(filled_in = (select(., -person_cols_not_responses) %>%
+                        pmap_lgl(function(...){ sum(list(...) == '') == 0 })))
+person
+```
+
+Now let's have another look at the `ranking` table:
+
+```{r}
+ranking
+```
+
+We're going to want to do a lot of analysis with this, so the first step is to make the rank values a little more distinguishable by changing `"vunimportant"` to `"very_unimportant"` and `"vimportant"` to `"very_important"`. Let's try that, and then double-check that we haven't changed the types of any columns:
+
+```{r}
+ranking %>%
+  map_dfr(function(x) str_replace(x, "vunimportant", "very_unimportant")) %>%
+  map_dfr(function(x) str_replace(x, "vimportant", "very_important")) %>%
+  summarize_all(class)
+```
+
+Oh dear---it looks like `str_replace` coerces numbers to character strings even when it doesn't modify anything. Let's be a bit more circumspect and apply this to just one column, and take advantage of the fact that we want leading `v`'s turned into `very_`'s:
+
+```{r}
+ranking <- ranking %>% mutate_at(c("rank"), function(x) str_replace(x, "^v", "very_"))
+ranking
+```
+
+Good: our data types are intact.  Now, how many ranks of each kind do we have for each question?
+
+```{r}
+ranking %>%
+  group_by(question_id, rank) %>%
+  summarize(number = n())
+```
+
+Whoops: there are some `NA`s for `rank`. Let's have a look at those:
+
+```{r}
+ranking %>% filter(is.na(rank))
+```
+
+740 records out of 7200 have `NA` ranking---i.e., a little over 10% of our responses are invalid. Do they all come from the same people? To find out, we'll look at people who have some `NA` rankings, and people who have some rankings that are not `NA`, and see if there is any overlap:
+
+```{r}
+person_with_NA_rank <- ranking %>%
+  filter(is.na(rank)) %>%
+  select(person_id) %>%
+  distinct()
+person_with_not_NA_rank <- ranking %>%
+  filter(!is.na(rank)) %>%
+  select(person_id) %>%
+  distinct()
+intersect(person_with_NA_rank, person_with_not_NA_rank)
+```
+
+Only one person has both `NA` and non-`NA` rankings---let's take a closer look at their data:
+
+```{r}
+ranking %>% filter(person_id == 127)
+```
+
+Paging through this, we discover that this person completed all of the rankings for stage 1, but none of the rankings for stage 2---i.e., it appears that they gave up halfway through the survey. Did they fill in anything for the demographic questions?
+
+```{r}
+person %>% filter(person_id == 127)
+```
+
+Nope---nothing there. Since it's only one person, and we don't know anything about them, we will drop their contributions from the `ranking` table:
+
+```{r}
+cat(nrow(ranking), 'records in ranking before dropping person 127\n')
+ranking <- ranking %>%
+  filter(person_id != 127)
+cat(nrow(ranking), 'records in ranking after dropping person 127\n')
+```
+
+That looks right: each stage has 20 questions, and there are 2 stages, so we should lose 40 records with this cleanup step.  Now, who gave us `NA` rankings?
+
+```{r}
+person_with_null_ranking <- ranking %>%
+  filter(is.na(rank)) %>%
+  pull(person_id) %>%
+  unique()
+person_with_null_ranking
+```
+
+That's eighteen people. Did any give us demographic information?
+
+```{r}
+person %>%
+  filter(person_id %in% person_with_null_ranking) %>%
+  select(person_id, filled_in)
+```
+
+Nope. Did any of them give us non-empty rankings?
+
+```{r}
+ranking %>%
+  filter(!is.na(rank)) %>%
+  filter(person_id %in% person_with_null_ranking)
+```
+
+Nope. We can therefore safely drop them from both tables as well:
+
+```{r}
+cat("before dropping, we have", nrow(person), "persons and", nrow(ranking), "rankings\n")
+person <- person %>%
+  filter(!(person_id %in% person_with_null_ranking))
+ranking <- ranking %>%
+  filter(!(person_id %in% person_with_null_ranking))
+cat("after dropping, we have", nrow(person), "persons and", nrow(ranking), "rankings\n")
+```
+
+## Preliminary Trends
+
+Having all the rankings in one column as text isn't particularly easy to work with. After a bit of experimentation, it turns out that it's simplest to create a table with a weight for each ranking where "very unimportant" is worth -2, "unimportant" is worth -1, "important" and "very important" are worth 1 and 2 respectively, and "indifferent" and "dont_understand" are worth 0. (We recognize that converting qualitative responses on a Likert scale to numerical weights after the fact is a statistical sin; we'll revisit this later.) We'll do this by creating a little lookup table:
+
+```{r}
+rank_lookup <- tribble(
+  ~rank, ~weight,
+  "very_unimportant", -2,
+  "unimportant", -1,
+  "indifferent", 0,
+  "dont_understand", 0,
+  "important", 1,
+  "very_important", 2)
+rank_lookup
+```
+
+and then join this with the `ranking` table:
+
+```{r}
+ranking_weight <- inner_join(ranking, rank_lookup, by = "rank")
+ranking_weight
+```
+
+I prefer using a join table because it is declarative: the lookup values are in a table like any other, rather than being buried in a function.
+
+Using these weights, we can calculate an average score per question:
+
+```{r}
+weighted_scores <- ranking_weight %>%
+  group_by(question_id) %>%
+  summarize(number = n(), score = sum(weight)/n())
+weighted_scores
+```
+
+What does that distribution look like? We'll start with a histogram of the number of ratings per question:
+
+```{r}
+ggplot(weighted_scores) +
+  geom_histogram(mapping = aes(x = number), binwidth = 1) + xlim(0, 35)
+  # ggtitle("Number of Ratings per Question")
+ggsave("figures/num_ratings_per_question.png", height = 2, width = 5)
+```
+
+(There is a warning here that two rows contain missing values because of the call to `xlim`, but manual inspection shows that the values for `number` lie in the the range 13 to 33, so...shrug?) Note that since the X axis is discrete, we've set the bin width to 1.  Let's check the distribution of scores:
+
+```{r}
+ggplot(weighted_scores) +
+  geom_histogram(mapping = aes(x = score), binwidth = 0.1) +
+  ggtitle("Number of Scores by Value")
+```
+
+And here is the distribution of the number of scores of each type (we have to do a bit of a dance with `complete` in order to ensure that zeroes are included in the histogram, and some more wrangling with factors to force a particular order of displays):
+
+```{r}
+ranking_values <- c("very_unimportant", "unimportant", "indifferent", "important", "very_important", "dont_understand")
+ranking_weight %>%
+  mutate_at(c("rank"), function(x) factor(x, levels = ranking_values)) %>%
+  mutate(count = 1) %>%
+  complete(question_id, rank, fill = list(count = 0)) %>%
+  group_by(question_id, rank) %>%
+  summarize(number = sum(count)) %>%
+  ggplot() +
+  geom_histogram(mapping = aes(x = number), binwidth = 1) +
+  facet_wrap(~rank)
+  # ggtitle("Distribution of Scores for Each Type of Ranking")
+ggsave("figures/score_distribution_by_rank.png", height = 3, width = 5)
+```
+
+Finally, let's use a scatterplot to see if there's any correlation between the number of rankings and the weighted score:
+
+```{r}
+ggplot(weighted_scores) +
+  geom_point(mapping = aes(x = number, y = score), alpha = 0.25) +
+  geom_smooth(mapping = aes(x = number, y = score), method = "loess") +
+  ggtitle("Weighted Score as a Function of Number of Rankings")
+```
+
+It doesn't look like there's any significant correlation between the number of rankings and the weighted score.
+
+## Demographics
+
+Time to learn a bit more about our respondents. Let's create a table that contains only records that were filled in:
+
+```{r}
+demographics <- person %>% filter(filled_in) %>% select(-filled_in)
+```
+
+and remind ourselves what information we have:
+
+```{r}
+colnames(demographics)
+```
+
+What does students' technology access look like?
+
+```{r}
+technology <- demographics %>%
+  select(starts_with("daily_"))
+technology %>%
+  gather(key = access, value = answer) %>%
+  ggplot() +
+  geom_bar(mapping = aes(x = access, fill = answer),
+           position = position_dodge(preserve = "single")) +
+  theme(axis.text.x = element_text(angle = -45, vjust = 0.5)) +
+  ggtitle("Student Access to Technology")
+```
+
+Hm---that will look better if we order the bars (and change the names, fixing the typo "querter" along the way). We'll use a factor for that (and save it so that we can re-use it in later plots):
+
+```{r}
+access_values = c("none", "quarter", "quertertothree", "morethanthree")
+access_names <- c("none", "low", "middling", "high")
+technology %>%
+  gather(key = access, value = answer) %>%
+  mutate_at(c("answer"), function(x) factor(x, levels = access_values, labels = access_names)) %>%
+  ggplot() +
+  geom_bar(mapping = aes(x = access, fill = answer),
+           position = position_dodge(preserve = "single")) +
+  theme(axis.text.x = element_text(angle = -45, vjust = 0.5)) +
+  ggtitle("Student Access to Technology")
+```
+
+
+How about teaching?  We're going to do a fair bit with this, so we'll create a `teaching` table that contains a subset of `demographics`' columns. (We'll hang on to `person_id` because we're going to need it later.)
+
+```{r}
+teaching <- demographics %>%
+  select(person_id, starts_with("teaching_"))
+teaching_values <- c("none", "tens", "hundreds", "primary")
+teaching %>%
+  gather(key = teaching, value = answer, starts_with("teaching_")) %>%
+  mutate_at(c("answer"), function(x) factor(x, levels = teaching_values)) %>%
+  ggplot() +
+  geom_bar(mapping = aes(x = teaching, fill = answer),
+           position = position_dodge(preserve = "single")) +
+  theme(axis.text.x = element_text(angle = -45, vjust = 0.5)) +
+  ggtitle("Time Spent Teaching")
+```
+
+Un oh---this seems to show that most of our respondents haven't taught. The problem, of course, is that most people probably only teach in one or two categories and say "none" for all the others, making "none" the most popular response in all cases. Let's try a bubble plot:
+
+```{r}
+teaching %>%
+  select(-person_id) %>%
+  gather(key = teaching, value = answer) %>%
+  group_by(teaching, answer) %>%
+  summarize(number = n()) %>%
+  ggplot() + geom_point(mapping = aes(x = teaching, y = answer, size = number)) +
+  theme(axis.text.x = element_text(angle = -45, vjust = 0.5)) +
+  ggtitle("Time Spent Teaching (Version 2)")
+```
+
+That's a bit more hopeful, but still doesn't tell us who's taught how often. What we probably want is to look at the number of people who've answered "primary" to anything, followed by the number who've answered "hundreds", then "tens", then "none":
+
+```{r}
+best_answer <- teaching %>%
+  select(-person_id) %>%
+  pmap_chr(function(...) {
+    r <- list(...)
+    if      ("primary" %in% r) {return("primary")}
+    else if ("hundreds" %in% r) {return("hundreds")}
+    else if ("tens" %in% r) {return("tens")}
+    else if ("none" %in% r) {return("none")}
+    else {stop("nothing recognized in row", r)}
+  })
+best_teaching <- teaching %>%
+  mutate(best_answer = best_answer) %>%
+  mutate_at(c("best_answer"), function(x) factor(x, levels = teaching_values)) %>%
+  group_by(best_answer)
+best_teaching_count <- best_teaching %>%
+  summarize(n = n())
+best_teaching_count
+```
+
+And let's plot that as well:
+
+```{r}
+best_teaching %>%
+  ggplot() +
+  geom_bar(mapping = aes(x = best_answer))
+  # ggtitle("Count of Best Answers to Teaching Time Questions")
+ggsave("figures/count_of_best_answers_for_teaching_time.png", height = 2, width = 5)
+```
+
+
+All right: teaching at some level was the primary responsibility of a majority of respondents, less than half only taught hundreds or tens of hours, and it appears that none of our respondents did no teaching at all. As a quick check, did anyone claim that their primary responsibility was teaching two or more categories?
+
+```{r}
+count_primary <- teaching %>%
+  select(-person_id) %>%
+  pmap_int(function(...) {
+    r <- list(...)
+    sum(r == "primary")
+  })
+teaching %>%
+  mutate(count_primary = count_primary) %>%
+  group_by(count_primary) %>%
+  ggplot() +
+  geom_bar(mapping = aes(x = count_primary)) +
+  ggtitle("Distribution of Number of Primary Teaching Responses")
+```
+
+It looks like three people answered "primary responsibility" for 3, 5, and 7 categories each. Let's take a closer look at those three people:
+
+```{r}
+teaching %>%
+  mutate(count_primary = count_primary) %>%
+  filter(count_primary > 2)
+```
+
+These three people may have misunderstood what we meant by "primary responsibility", so it might make sense to drop them from our analysis. Instead, we will classify them as "other" when we put people into demographic buckets in the decision tree further below.
+
+What about the people who listed two primary categories?
+
+```{r}
+pairs <- teaching %>%
+  mutate(count_primary = count_primary) %>%
+  filter(count_primary == 2) %>%
+  select(-count_primary) %>%
+  pmap(function(...) {
+    args <- list(...)
+    temp <- map2(colnames(teaching), args, function(name, value){ifelse(value == "primary", name, "")})
+    temp[temp != ""]
+  })
+tibble(left = map_chr(pairs, function(x) x[[1]]),
+       right = map_chr(pairs, function(x) x[[2]])) %>%
+  group_by(left, right) %>%
+  summarize(number = n()) %>%
+  arrange(desc(number))
+```
+
+That's good news: ten people are teaching children and teens in schools. One person is teaching teens in schools and students in college, one is teaching adults in the workplace or in free-range settings, and only two defy easy classification. Let's see if we can classify people by primary, then by a single hundreds value (if there is one):
+
+```{r}
+count_hundred <- teaching %>%
+  pmap_int(function(...) {
+    r <- list(...)
+    sum(r == "hundreds")
+  })
+teaching %>%
+  mutate(primary = count_primary, hundred = count_hundred) %>%
+  filter(primary == 0) %>%
+  group_by(hundred) %>%
+  summarize(number = n()) %>%
+  select(hundred, number) %>%
+  arrange(desc(number))
+```
+
+That's sort of promising: most of the people who didn't say that some kind of teaching is their primary activity have only one activity that they've put hundreds of hours into. Are they mostly teaching in schools?
+
+```{r}
+teaching %>%
+  mutate(primary = count_primary) %>%
+  filter(primary == 0) %>%
+  map_dfc(function(x) sum(x == "hundreds")) %>%
+  gather(key = "where", value = "number") %>%
+  arrange(desc(number))
+```
+
+Interesting: they're mostly teaching in colleges or in the workplace. Of those, how many do both? (Note that we use `&` to force evaluation of all conditions rather than `&&` that short-circuits in the code below.)
+
+```{r}
+teaching %>%
+  mutate(primary = count_primary) %>%
+  filter((primary == 0) & (teaching_adults_workplace == "hundreds") & (teaching_students_college == "hundreds")) %>%
+  nrow()
+```
+
+So 8 are teaching both at college and in the workplace, which is a majority of those who teach in the workplace but less than a third of those who teach at college.
+
+It's time to classify people. We'll use the following buckets:
+
+-   `teaching_children_in_schools` and `teaching_teens_in_schools` will be `young_formal`
+-   `teaching_children_free_range` and `teaching_teens_free_range` will be `young_free_range`
+-   `teaching_students_college` and `teaching_adults_workplace` will be `adult_formal`
+-   `teaching_adults_free_range` will be `adult_free_range`
+
+Here's our decision tree:
+
+```
+if (person has declared one category as "primary"):
+    bucket = bucket of that category
+else if (person has declared both "teaching_children_in_schools" and "teaching_teens_in_schools" as "primary")
+    bucket = "young_formal"
+else if (person has declared more than one category as "primary")
+    bucket = "other"
+else if (person has declared one category as "hundreds"):
+    bucket = bucket of that category
+else if (person has declared both "teaching_students_college" and "teaching_adults_workplace" as "hundreds")
+    bucket = "adult_formal"
+else
+    bucket = "other"
+```
+
+And here it is in R:
+
+```{r}
+mapping <- c(teaching_children_in_schools = "young_formal",
+             teaching_teens_in_schools = "young_formal",
+             teaching_children_free_range = "young_free_range",
+             teaching_teens_free_range = "young_free_range",
+             teaching_students_college = "adult_formal",
+             teaching_adults_workplace = "adult_formal",
+             teaching_adults_free_range = "adult_free_range")
+
+augmented <- teaching %>%
+  mutate(primary = count_primary, hundred = count_hundred)
+
+teaching$bucket <- augmented %>%
+  pmap_chr(function(...){
+    args <- as.character(list(...))
+    names(args) <- colnames(augmented)
+    if (args["primary"] == 1) {
+      result <- mapping[colnames(augmented)[args == "primary"]]
+    } else if ((args["teaching_children_in_schools"] == "primary") &&
+               (args["teaching_teens_in_schools"] == "primary")) {
+      result <- "young_formal"
+    } else if (args["primary"] > 1) {
+      result <- "other"
+    } else if (args["hundred"] == 1) {
+      result <- mapping[colnames(augmented)[args == "hundreds"]]
+    } else if ((args["teaching_students_college"] == "hundreds") &&
+               (args["teaching_adults_workplace"] == "hundreds")) {
+      result <- "adult_formal"
+    } else {
+      result <- "other"
+    }
+    result
+  }) %>%
+  as.character()
+
+teaching %>%
+  group_by(bucket) %>%
+  summarize(number = n(), fraction = number / nrow(teaching)) %>%
+  select(bucket, number, fraction) %>%
+  arrange(desc(number))
+```
+
+In other words, 57% of our respondents are involved in formal adult education, 26.5% in formal education for children and teens, 5% are primarily involved in free-range education for learners of all ages, and 11% are difficult to categorize.
+
+## A Little More Filtering
+
+Before we go any further, how are we going to handle responses where people told us they didn't understand the question? First, how many of those are there?
+
+```{r}
+nrow(ranking)
+ranking %>%
+  filter(rank == "dont_understand") %>%
+  nrow()
+```
+
+2.7% of our responses fall into this category. Were there any particularly incomprehensible questions?
+
+```{r}
+ranking %>%
+  group_by(question_id) %>%
+  summarize(total = n(), fraction = sum(rank == "dont_understand") / total) %>%
+  filter(fraction > 0) %>%
+  arrange(desc(fraction))
+```
+
+Half of respondents didn't understand question #396, which is:
+
+```{r}
+question %>% filter(question_id == 396) %>% select(question_content)
+```
+
+Even if we remove "don't understand" from our rankings, we'll still have a dozen or more for every question. Since it's hard to know how to evaluate the importance given to a question that wasn't understood, let's do that:
+
+```{r}
+ranking_firm <- ranking %>%
+  filter(rank != "dont_understand")
+nrow(ranking)
+nrow(ranking_firm)
+```
+
+6440 - 6261 is indeed 179 (the number of "don't understand" responses we found earlier), so we'll use `ranking_firm` from now on.
+
+## Back to the Questions
+
+It's time to go back and look at how the rankings for questions vary according to demographics. To do this, we need a table that has one record for each ranking (except those done by the one person we discarded from our data). Each record needs to have:
+
+-   the ranking ID
+-   the question ID
+-   the person ID
+-   the weight associated with the ranking (which is a direct translation of the ranking's textual name)
+-   the bucket associated with the person *or* the newly-created bucket "unknown" for people who didn't give us demographic information.
+
+The `ranking_firm` table has most of what we need; the `person` table has the IDs of all the people who gave us rankings, while `teaching` has buckets for everyone who gave us demographics. Let's do a left join on `person` and `teaching` and fill in the missing bucket values:
+
+```{r}
+bucketed <- left_join(person, teaching, by = "person_id") %>%
+  select(person_id, bucket) %>%
+  mutate(person_id = as.integer(person_id), filled = ifelse(is.na(bucket), "unknown", bucket)) %>%
+  select(person_id, bucket = filled)
+bucketed
+```
+
+We can now join the `ranking_firm` table and the `bucketed` table to create `quesdemo` (for "question demographics"):
+
+```{r}
+quesdemo <- inner_join(ranking_firm, bucketed, by = "person_id")
+quesdemo
+```
+
+Now, it's meaningless to use `question_id` as an ordering, but it does spread out the scores from different demographic buckets for the same question. It's also statistically invalid to assign arbitrary weights to the answers to a categorical question, but doing this (as we did earlier for the `ranking_weight` table) will help us find some patterns. Let's add the same weights we used for `ranking_weight` to `quesdemo`:
+
+```{r}
+quesdemo_weight <- inner_join(quesdemo, rank_lookup, by = "rank")
+quesdemo_weight
+```
+
+and then look at the five demographic buckets separately:
+
+```{r}
+quesdemo_weight %>%
+  group_by(question_id, bucket) %>%
+  summarize(mean_weight = mean(weight)) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = question_id, y = mean_weight, color = bucket), alpha = 0.5) +
+  facet_grid(cols = vars(bucket)) +
+  ggtitle("Distribution of Rankings by Bucket")
+```
+
+Which 20 questions have the highest overall score?
+
+```{r}
+top_20 <- quesdemo_weight %>%
+  group_by(question_id) %>%
+  summarize(mean_weight = mean(weight)) %>%
+  top_n(20, wt = mean_weight) %>%
+  arrange(desc(mean_weight)) %>%
+  select(question_id)
+top_20 <- top_20[1:20, ] # because of ties
+inner_join(top_20, question, by = "question_id") %>%
+  select(question_content)
+```
+
+(`top_n` gives us 22 questions because of ties in scores; we select the top 20 of those by indexing.) Let's calculate the weighted score per bucket for those questions and see how they vary from question to question:
+
+```{r}
+inner_join(quesdemo_weight, top_20, by = "question_id") %>%
+  group_by(question_id, bucket) %>%
+  summarize(mean_weight = mean(weight)) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = question_id, y = mean_weight, color = bucket)) +
+  facet_grid(cols = vars(question_id)) +
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank()) +
+  ggtitle("Rankings by Bucket for Top 20 Questions")
+```
+
+It's not the prettiest plot in the world, and the wide spread for some demographic buckets may be an artefact of having fewer people in that bucket, but it's a start.
+
+Let's try a more interesting question: what questions had the widest spread of scores? Since the actual classification is categorical data, we'll group questions according to lowest and highest category, and then show the mean on a color scale and the standard deviation with circle size:
+
+```{r}
+quesdemo_weight %>%
+  group_by(question_id) %>%
+  mutate(least = min(weight), greatest = max(weight), std_dev = sd(weight), ave = mean(weight)) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = least, y = greatest, color = ave, size = std_dev), alpha = 0.5) +
+  ggtitle("Highest and Lowest Rankings")
+```
+
+Well, that's not helpful, and it's not statistically sound either: we should not treat categorical responses as continuous variables. What if we plot individual questions according to the fraction of rankings that were very important vs. very unimportant, and use size and color to show the fraction that were important and unimportant---will that give us any insight?
+
+```{r}
+quesdemo_weight %>%
+  group_by(question_id) %>%
+  mutate(num_total = n(),
+         num_very_un = sum(weight == -2), frac_very_un = num_very_un/num_total,
+         num_very_im = sum(weight ==  2), frac_very_im = num_very_im/num_total,
+         num_un  = sum(weight == -1), frac_un = num_un/num_total,
+         num_im  = sum(weight ==  1), frac_im = num_im/num_total) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = frac_very_un, y = frac_very_im, color = frac_un, size = frac_im), alpha = 0.5) +
+  ggtitle("Very Important vs. Very Unimportant")
+```
+
+A lot of questions didn't have anyone rate them "very unimportant", which is why we have the cluster on the left. (This is a sign that we should have used a different procedure for asking for rankings, which we'll discuss in the paper.) Let's try using "unimportant" and "important" as the X and Y axes, and color and size for "very unimportant" and "very important":
+
+```{r}
+quesdemo_weight %>%
+  group_by(question_id) %>%
+  mutate(num_total = n(),
+         num_very_un = sum(weight == -2), frac_very_un = num_very_un/num_total,
+         num_very_im = sum(weight ==  2), frac_very_im = num_very_im/num_total,
+         num_un  = sum(weight == -1), frac_un = num_un/num_total,
+         num_im  = sum(weight ==  1), frac_im = num_im/num_total) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = frac_un, y = frac_im, color = frac_very_un, size = frac_very_im), alpha = 0.5) +
+  ggtitle("Important vs. Unimportant")
+```
+
+Nope: there are still a lot that had no "unimportant" rankings.  Will the picture become clearer if we combine all the negative rankings and all the positive rankings without weighting them?
+
+```{r}
+quesdemo_weight %>%
+  group_by(question_id) %>%
+  mutate(num_total = n(),
+         num_low = sum(weight < 0), frac_low = num_low/num_total,
+         num_high = sum(weight > 0), frac_high = num_high/num_total,
+         num_other = sum(weight == 0), frac_other = num_other/num_total) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = frac_low, y = frac_high, color = frac_other), alpha = 0.5) +
+  ggtitle("Positive Rankings vs. Negative Rankings (With Some Indifference)")
+```
+
+Using color for the fraction of responses that were "indifferent" is redundant here, since the sum of the three groups has to be 1. Let's take advantage of that and bucket this plot:
+
+```{r}
+quesdemo_weight %>%
+  group_by(question_id, bucket) %>%
+  mutate(num_total = n(),
+         num_low = sum(weight < 0), frac_low = num_low/num_total,
+         num_high = sum(weight > 0), frac_high = num_high/num_total) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = frac_low, y = frac_high, color = bucket), alpha = 0.5) +
+  facet_wrap(~bucket) +
+  ggtitle("Positive Rankings vs. Negative Rankings by Respondent Bucket")
+```
+
+Again, the sparsity of responses for people teaching free-range learners is crippling. We need to go back and see if those two categories are reflected in rankings, and if not, to collapse them into the buckets for instructors in formal settings.
+
+## A More Systematic Approach
+
+Let's take another run at this:
+
+1.  It isn't legitimate to assign weights to categorical variables like rankings because we don't know whether people think "very important" is twice, three times, or a gajillion times more important than plain old "important".  What we *can* do is look at how sensitive rankings are to changes in those weightings.
+2.  To do this, we can calculate an average score for each question by weighting "important" and "very important" as +1, and "unimportant" and "very unimportant" as -1 (i.e., give normal and "very" the same weight). Use those scores to rank questions from most interesting to least.
+3.  We can then calculate an average score for each question using only the "very" ratings, which is essentially the same as making "very something" infinitely weightier than plain old "something".  Use those scores to rank questions as well.
+4.  Now that we have those numbers, we can calculate the distance between two rankings using Euclidean distance between rank order.  For example, if the questions are labelled A, B, and C, and one ranking is A-B-C, we can represent that as `{A: 1, B: 2, C: 3}`.  If another ranking is B-A-C, we can represent that as `{A: 2, B: 1, C: 3}`; the distance is therefore `sqrt((1-2)**2 + (2-1)**2 + (3-3)**2)` = `sqrt(2)`.
+5.  Finally, we can now look at how difference in ranking changes as the weight given to "very" goes from 1.0 (the "equal weights" scenario of step 2 above) to infinite (the "only very" scenario of step 3).
+
+We're going to need some functions. Let's start with one that generates a table of weighting factors:
+
+```{r}
+# Create a symmetric table of weights. If "very" is 1.0, all the weight goes
+# to the "very" answers; if "very" is 0.0, "very" and regular are evenly
+# weighted.
+create_weights <- function(very) {
+  tribble(
+    ~rank, ~weight,
+    "very_unimportant", -(1.0 + very),
+    "unimportant", -(1.0 - very),
+    "indifferent", 0,
+    "important", 1.0 - very,
+    "very_important", 1.0 + very,
+    "dont_understand", 0
+  )
+}
+
+even_handed_weights <- create_weights(0.0)
+even_handed_weights
+```
+
+Good. We're also going to want weights for the other end of the spectrum:
+
+```{r}
+only_very_weights <- create_weights(1.0)
+only_very_weights
+```
+
+It doesn't matter that these are 2/-2 instead of 1/-1, because we're using them to establish an ordering.
+
+We can now apply such a weighting function to find the sorted location for each question. We'll do this with the original `quesdemo` table, since we don't want the arbitrary weights added to `quesdemo_weight` for exploratory purposes. This function does the join and ordering given a weight table:
+
+```{r}
+# Apply a tibble of weights with column titles "rank" and "weight" to the data.
+apply_weights <- function(data, weights) {
+  data %>%
+    inner_join(weights, by = "rank") %>%
+    group_by(question_id) %>%
+    summarize(score = mean(weight)) %>%
+    mutate(place = min_rank(desc(score))) %>%
+    select(question_id, place)
+}
+```
+
+Let's try it for the two endpoints:
+
+```{r}
+even_handed_order <- apply_weights(quesdemo, even_handed_weights)
+even_handed_order
+```
+
+And for the ordering where we only care about "very" responses:
+
+```{r}
+only_very_order <- apply_weights(quesdemo, only_very_weights)
+only_very_order
+```
+
+Excellent: we have our ordering, and it's different under different weighting regimes.
+
+We also need a function to calculate the distance between two vectors---we don't have to worry about normalizing to unit vectors since each vector should have the same values, just differently arranged:
+
+```{r}
+# Calculate distance between two vectors of question placements.
+distance <- function(left, right) {
+  sum(abs(left - right))
+}
+```
+
+What's the distance between our two extreme cases?
+
+```{r}
+distance(even_handed_order$place, only_very_order$place)
+```
+
+Now, how does the distance between our ranking and a particular ranking change as we go from even-handed to only-very?
+
+```{r}
+# Calculate distance using 'place' columns of origin and a series of weighted placements.
+delta_balance <- function(data, origin, veries) {
+  dist = double(length = length(veries))
+  for (i in seq_along(veries)) {
+    weights <- create_weights(veries[i])
+    temp <- apply_weights(data, weights)
+    dist[i] <- distance(origin$place, temp$place)
+  }
+  tibble(very = veries, distance = dist)
+}
+```
+
+Let's take a deep breath and try it:
+
+```{r}
+STEPS <- 20
+steps <- (0:STEPS) / STEPS
+delta_balance(quesdemo, even_handed_order, steps) %>%
+  ggplot() +
+  geom_line(mapping = aes(x = very, y = distance)) +
+  ggtitle("Distance from even-handed weighting as balance changes")
+```
+
+Damn---we expected the rankings would settle down fairly quickly, so that the distance would stabilize.  What about distance from a ranking where only the "veries" count?
+
+```{r}
+only_very_order <- apply_weights(quesdemo, only_very_weights)
+delta_balance(quesdemo, only_very_order, steps) %>%
+  ggplot() +
+  geom_line(mapping = aes(x = very, y = distance)) +
+  ggtitle("Distance from weight where only 'very' matters")
+```
+
+This is the same behavior: as we change the balance, the distance between the ranking vectors changes more or less linearly. This is unhelpful: if there was a sharp knee, we could focus on one side or the other.
+
+But wait: what we're *really* interested in is which questions are in the top N. Let's create a new function to tell us whether a question is in the top 20 or not under some weighting:
+
+```{r}
+# Apply a tibble of weights with column titles "rank" and "weight" to the data.
+THRESHOLD <- 20
+in_top <- function(data, weights, threshold = THRESHOLD) {
+  data %>%
+    inner_join(weights, by = "rank") %>%
+    group_by(question_id) %>%
+    summarize(score = mean(weight)) %>%
+    mutate(top = (min_rank(desc(score)) <= threshold)) %>%
+    select(question_id, score, top)
+}
+```
+
+Some quick tests:
+
+```{r}
+even_handed_in_top_20 <- in_top(quesdemo, even_handed_weights)
+only_very_in_top_20 <- in_top(quesdemo, only_very_weights)
+sum(even_handed_in_top_20$top)
+```
+
+Hm---we expected 20, not 21. Let's take a closer look:
+
+```{r}
+in_top(quesdemo, even_handed_weights) %>%
+  filter(top) %>%
+  group_by(score) %>%
+  summarize(number = n()) %>%
+  arrange(desc(number))
+```
+
+All right, there are ties---we'll include them until we know better. Let's see what happens if we look at the change in the top 20 (ish) as a function of weighting:
+
+```{r}
+delta_top <- function(data, origin, very_balance) {
+  d = double(length = length(very_balance))
+  for (i in seq_along(very_balance)) {
+    weights <- create_weights(very_balance[i])
+    temp <- in_top(data, weights)
+    d[i] <- sum(origin$top & temp$top)
+  }
+  tibble(very = very_balance, distance = d)
+}
+```
+
+```{r}
+delta_top(quesdemo, even_handed_in_top_20, steps) %>%
+  ggplot() +
+  geom_line(mapping = aes(x = very, y = distance)) +
+  expand_limits(y = 0) +
+  ggtitle("Distance from even-handed weighting as balance changes")
+```
+
+and:
+
+```{r}
+delta_top(quesdemo, only_very_in_top_20, steps) %>%
+  ggplot() +
+  geom_line(mapping = aes(x = very, y = distance)) +
+  expand_limits(y = 0) +
+  ggtitle("Distance from even-handed weighting as balance changes")
+```
+
+This seems to tell us that 9 questions stay in the top 20 no matter what weighting we use. Let's have a closer look:
+
+```{r}
+even_handed_top_20_question_ids <- quesdemo %>% in_top(even_handed_weights) %>% filter(top) %>% pluck("question_id")
+only_very_top_20_question_ids <- quesdemo %>% in_top(only_very_weights) %>% filter(top) %>% pluck("question_id")
+always_top_20_question_ids <- intersect(even_handed_top_20_question_ids, only_very_top_20_question_ids)
+always_top_20_question_ids
+```
+
+All right: what are those questions?
+
+```{r}
+question %>%
+  filter(question_id %in% always_top_20_question_ids) %>%
+  pull("question_content") %>%
+  print()
+```
+
+What categories are they in?
+
+```{r}
+question %>%
+  filter(question_id %in% always_top_20_question_ids) %>%
+  inner_join(category, by = "category_id") %>%
+  select(category_name) %>%
+  distinct()
+```
+
+Much to our surprise, "Languages and Tools", "Curriculum", and "Inclusivity" are *not* represented in this list.
+
+## Who Cares About What?
+
+Our next step will be to look at how the questions that remain interesting at different weightings changes as we slice our data in various ways. We start by wrapping the steps up in a function, and running it on all the data to check that we get the same result as before:
+
+```{r}
+# A utility we're going to want later for getting readable info from question IDs.
+question_info <- function(
+  question_ids,
+  question_tbl = question,
+  category_tbl = category
+){
+  question_tbl %>%
+    filter(question_id %in% question_ids) %>%
+    inner_join(category_tbl, by = "category_id") %>%
+    select(question_id, category_name, question_content)
+}
+
+# Find questions that are interesting under the extremes for a slice of data.
+interesting <- function(
+  data,
+  left_weights = even_handed_weights,
+  right_weights = only_very_weights
+) {
+  left <- in_top(data, left_weights) %>% filter(top)
+  right <- in_top(data, right_weights) %>% filter(top)
+  joint_question_ids <- intersect(left$question_id, right$question_id)
+  question_info(joint_question_ids)
+}
+
+interesting(quesdemo)
+```
+
+Good: that's the same list---but is that right? Let's try selecting the first five rows of the table:
+
+```{r}
+quesdemo %>% slice(1:5)
+```
+
+and then running our function:
+
+```{r}
+quesdemo %>% slice(1:5) %>% interesting()
+```
+
+OK: if we only have 5 questions, they'll be in the top 20 no matter how we weight rankings, so they all appear. What if we have 25 questions? We should see 20 or fewer rows:
+
+```{r}
+quesdemo %>% slice(1:25) %>% interesting() %>% nrow()
+```
+
+Uh oh: why do we have 23? Let's break it down:
+
+```{r}
+even_handed_temp <- quesdemo %>%
+  slice(1:25) %>%
+  in_top(even_handed_weights) %>%
+  filter(top)
+even_handed_temp
+```
+
+```{r}
+only_very_temp <- quesdemo %>%
+  slice(1:25) %>%
+  in_top(only_very_weights) %>%
+  filter(top)
+only_very_temp
+```
+
+```{r}
+joint_question_ids <- intersect(even_handed_temp$question_id, only_very_temp$question_id)
+joint_question_ids
+```
+
+That actually makes sense: most of the questions represented by the first 25 rows have scores of 1 or 0 under even-handed weighting, so when we keep ties, we wind up with almost all of them. The same happens with only-very weighting, so when we intersect, we wind up with a long list What if we look at the top 100 rows?
+
+```{r}
+quesdemo %>%
+  slice(1:100) %>%
+  interesting() %>%
+  nrow()
+```
+
+And the first 1000?
+
+```{r}
+quesdemo %>%
+  slice(1:1000) %>%
+  interesting() %>%
+  nrow()
+```
+
+Good: as we include more data, scores become more of a continuum, ties become less important, and fewer questions survive the "always interesting" test.
+
+Now, back to slicing our data.  What are our demographic buckets?
+
+```{r}
+quesdemo %>%
+  select(bucket) %>%
+  distinct()
+```
+
+What are the most interesting questions for people who teach children and teenagers in school?
+
+```{r}
+young_formal <- quesdemo %>%
+  filter(bucket == "young_formal") %>%
+  interesting()
+young_formal
+```
+
+That's kind of hard to read, so let's write a formatting function:
+
+```{r}
+readable <- function(data) {
+  paste0(data$question_id, " [", data$category_name, "]: ", data$question_content)
+}
+```
+
+Let's try again:
+```{r}
+young_formal %>% readable()
+```
+
+All right, that's different from the set we had for the entire population. What about people teaching adults in formal settings?
+
+```{r}
+adult_formal <- quesdemo %>%
+  filter(bucket == "adult_formal") %>%
+  interesting()
+adult_formal %>% readable()
+```
+
+The differences in the sizes of these sets is becoming annoying, but the shift in questions is still very interesting. The sets are much smaller, but for completeness let's have a look at things that are interesting to people teaching youngsters in free-range settings:
+
+```{r}
+young_free_range <- quesdemo %>%
+  filter(bucket == "young_free_range") %>%
+  interesting()
+young_free_range %>% readable()
+```
+
+And free-range adults:
+
+```{r}
+adult_free_range <- quesdemo %>%
+  filter(bucket == "adult_free_range") %>%
+  interesting()
+adult_free_range %>% readable()
+```
+
+Again, the fewer responses we have, the more ties we get, and the longer our lists become.
+
+We can go further. What questions are interesting to people who primarily teach youth?
+
+```{r}
+young_all <- quesdemo %>%
+  filter(bucket %in% c("young_formal", "young_free_range")) %>%
+  interesting()
+young_all %>% readable()
+```
+
+And adults?
+
+```{r}
+adult_all <- quesdemo %>%
+  filter(bucket %in% c("adult_formal", "adult_free_range")) %>%
+  interesting()
+adult_all %>% readable()
+```
+
+And now some payoff: what do people who teach youth care about that people who teach adults *don't* care (as much) about?
+
+```{r}
+setsub <- function(x, y) {
+  intersect(x, setdiff(x, y))
+}
+
+young_but_not_adult <- setsub(young_all$question_id, adult_all$question_id)
+question_info(young_but_not_adult) %>% readable()
+```
+
+And what do people who teach adults care about that people who teach youth don't care about (as much)?
+
+```{r}
+adult_but_not_young <- setsub(adult_all$question_id, young_all$question_id)
+question_info(adult_but_not_young) %>% readable()
+```
+
+## What do Researchers and Non-Researchers Care About?
+
+What do people who do computing education research care most about? Let's get the IDs of the people who are primarily or regularly involved in it as a vector (so that we can use `%in%` on it later):
+
+```{r}
+researcher_primary_regular_ids <- demographics %>%
+  filter(comp_research_involvement %in% c("primary", "regular")) %>%
+  pull(person_id)
+length(researcher_primary_regular_ids)
+```
+
+That's about a third of our 151 respondents. Their favorite questions are:
+
+```{r}
+cat("Favorites for (Primary, Regular)\n")
+researcher_primary_regular <- quesdemo %>%
+  filter(person_id %in% researcher_primary_regular_ids) %>%
+  interesting()
+researcher_primary_regular %>% readable()
+```
+
+What are non-researchers interested in?
+
+```{r}
+cat("Favorites for NOT (Primary, Regular)\n")
+researcher_not_primary_regular_ids <- demographics %>%
+  filter(!(comp_research_involvement %in% c("primary", "regular"))) %>%
+  pull(person_id)
+not_researcher_primary_regular <- quesdemo %>%
+  filter(person_id %in% researcher_not_primary_regular_ids) %>%
+  interesting()
+not_researcher_primary_regular %>% readable()
+```
+
+And those that are interesting to both groups?
+
+```{r}
+intersect(researcher_primary_regular$question_id, not_researcher_primary_regular$question_id)
+```
+
+Nothing: no questions are at the top of the list for both researchers and non-researchers.
+
+Let's try slicing the data a different way, and look at people who list research as a "primary" or "occasional" interest:
+
+```{r}
+researcher_primary_occasional_ids <- demographics %>%
+  filter(comp_research_involvement %in% c("primary", "occasional")) %>%
+  pull(person_id)
+length(researcher_primary_occasional_ids)
+```
+
+There are a few more people in this group.  Their favorite questions are:
+
+```{r}
+cat("Favorites for (Primary, Occasional)\n")
+researcher_primary_occasional <- quesdemo %>%
+  filter(person_id %in% researcher_primary_occasional_ids) %>%
+  interesting()
+researcher_primary_occasional %>% readable()
+```
+
+Has it made much of a difference compared to using "primary" and "regular"?
+
+```{r}
+interesting_to_researchers_question_ids <- intersect(researcher_primary_regular$question_id, researcher_primary_occasional$question_id)
+interesting_to_researchers_question_ids
+```
+
+Yes: only two questions are interesting to both decompositions. They are:
+
+```{r}
+question %>% filter(question_id %in% interesting_to_researchers_question_ids)
+```
+
+What are non-researchers by this second grouping interested in?
+
+```{r}
+cat("Favorites for NOT (Primary, Occasional)\n")
+researcher_not_primary_occasional_ids <- demographics %>%
+  filter(!(comp_research_involvement %in% c("primary", "occasional"))) %>%
+  pull(person_id)
+not_researcher_primary_occasional <- quesdemo %>%
+  filter(person_id %in% researcher_not_primary_occasional_ids) %>%
+  interesting()
+not_researcher_primary_occasional %>% readable()
+```
+
+And those that are interesting to both groups when sliced this way?
+
+```{r}
+intersect(researcher_primary_regular$question_id, not_researcher_primary_regular$question_id)
+```
+
+Again, there is no overlap.
+
+## What are the *Least* Interesting Questions?
+
+Let's have a look at questions that had negative overall scores for all weightings:
+
+```{r}
+in_bottom <- function(data, weights) {
+  data %>%
+    inner_join(weights, by = "rank") %>%
+    group_by(question_id) %>%
+    summarize(score = mean(weight)) %>%
+    filter(score < 0.0) %>%
+    pull(question_id)
+}
+even_handed_bottom_ids <- in_bottom(quesdemo, even_handed_weights)
+only_very_bottom_ids <- in_bottom(quesdemo, only_very_weights)
+intersect(even_handed_bottom_ids, only_very_bottom_ids) %>%
+  question_info() %>%
+  readable()
+```
+
+## How Weightings Map to Counts
+
+Let's take one last look at the case where "very" counts as twice as important as a plain old rating. To get this, we use a weighting of 1/3, so that plain old is scored as 2/3 and "very" is scored as 4/3:
+
+```{r}
+doubled_weights <- create_weights(1/3)
+doubled_weights
+```
+
+```{r}
+quesdemo %>%
+  mutate(zing = rank %in% c("important", "very_important")) %>%
+  inner_join(doubled_weights, by = "rank") %>%
+  group_by(question_id) %>%
+  summarize(weight_mean = mean(weight), zing_mean = mean(zing)) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = weight_mean, y = zing_mean), alpha = 0.5)
+ggsave("figures/importance_vs_double_weight.png", height = 2, width = 5)
+```
