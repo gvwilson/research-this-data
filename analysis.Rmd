@@ -291,6 +291,7 @@ ranking_weight %>%
   summarize(number = sum(count)) %>%
   ggplot() +
   geom_histogram(mapping = aes(x = number), binwidth = 1) +
+  labs(x="number of rankings", y="count of questions") +
   facet_wrap(~rank)
   # ggtitle("Distribution of Scores for Each Type of Ranking")
 ggsave("figures/score_distribution_by_rank.png", height = 3, width = 5)
