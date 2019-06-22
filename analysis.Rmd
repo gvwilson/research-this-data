@@ -1291,6 +1291,8 @@ quesdemo %>%
   group_by(question_id) %>%
   summarize(weight_mean = mean(weight), zing_mean = mean(zing)) %>%
   ggplot() +
-  geom_point(mapping = aes(x = weight_mean, y = zing_mean), alpha = 0.5)
-ggsave("figures/importance_vs_double_weight.png", height = 2, width = 5)
+  geom_point(mapping = aes(x = zing_mean, y = weight_mean), alpha = 0.5) +
+  labs(x = "% important/very important responses",
+       y = "Mean numeric rating (ω = 0.5)")
+ggsave("figures/importance_vs_double_weight.png", height = 3, width = 5)
 ```
